@@ -19,7 +19,7 @@ mod package_path;
 mod pr;
 mod pr_parser;
 mod project;
-mod registry_packages;
+pub mod registry_packages;
 mod release_order;
 pub(crate) mod release_regex;
 mod repo_url;

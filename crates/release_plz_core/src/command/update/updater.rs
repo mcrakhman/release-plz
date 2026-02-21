@@ -8,7 +8,7 @@ use cargo::util::VersionExt as _;
 use cargo_metadata::{
     Package, TargetKind,
     camino::{Utf8Path, Utf8PathBuf},
-    semver::Version,
+    semver::{self, Version},
 };
 use cargo_utils::{CARGO_TOML, LocalManifest};
 use git_cliff_core::{
@@ -35,9 +35,11 @@ use crate::{
     version::NextVersionFromDiff as _,
 };
 
+use crate::version::BumpLevel;
+
 use super::{
     PackagesToUpdate, PackagesUpdate, package_dependencies::PackageDependencies as _,
-    update_request::UpdateRequest,
+    update_request::{ReleaseMode, UpdateRequest},
 };
 
 static SEMVER_CHECK_LOG_ONCE: Once = Once::new();
@@ -61,6 +63,26 @@ impl Updater<'_> {
         let packages_diffs = self
             .get_packages_diffs(registry_packages, repository)
             .await?;
+
+        match self.req.release_mode() {
+            ReleaseMode::Rc | ReleaseMode::Stable => {
+                self.packages_to_update_rc_stable(packages_diffs, repository)
+            }
+            ReleaseMode::Default => {
+                self.packages_to_update_default(
+                    packages_diffs,
+                    local_manifest_path,
+                )
+            }
+        }
+    }
+
+    /// Default mode: existing single-pass behavior, unchanged.
+    fn packages_to_update_default(
+        &self,
+        packages_diffs: Vec<(&Package, Diff)>,
+        local_manifest_path: &Utf8Path,
+    ) -> anyhow::Result<PackagesUpdate> {
         let version_groups = self.get_version_groups(&packages_diffs)?;
         debug!("version groups: {:?}", version_groups);
 
@@ -158,6 +180,179 @@ impl Updater<'_> {
         Ok(packages_to_update)
     }
 
+    /// RC/Stable mode: two-pass version calculation with transitive bump propagation.
+    fn packages_to_update_rc_stable(
+        &self,
+        packages_diffs: Vec<(&Package, Diff)>,
+        repository: &Repo,
+    ) -> anyhow::Result<PackagesUpdate> {
+        let release_mode = self.req.release_mode();
+        let mut packages_to_update = PackagesUpdate::default();
+
+        // ── Pass 1: per-package bump from own commits ──
+        // Collect (package, diff, own_bump, base_version) for each package with changes.
+        struct Pass1Entry<'a> {
+            package: &'a Package,
+            diff: Diff,
+            own_bump: BumpLevel,
+            base_version: Version,
+        }
+
+        let mut pass1: Vec<Pass1Entry<'_>> = Vec::new();
+
+        for (p, diff) in &packages_diffs {
+            let base_version = match &diff.base_version {
+                Some(v) => v.clone(),
+                // No stable tag found — use current version as base.
+                None => p.version.clone(),
+            };
+
+            if diff.commits.is_empty() && diff.registry_package_exists {
+                // No own commits — own_bump is None, but we still track it
+                // for potential dependency-triggered bumps.
+                pass1.push(Pass1Entry {
+                    package: p,
+                    diff: diff.clone(),
+                    own_bump: BumpLevel::None,
+                    base_version,
+                });
+                continue;
+            }
+
+            if !diff.registry_package_exists {
+                // New package — include as-is with no bump (it uses its Cargo.toml version).
+                pass1.push(Pass1Entry {
+                    package: p,
+                    diff: diff.clone(),
+                    own_bump: BumpLevel::None,
+                    base_version,
+                });
+                continue;
+            }
+
+            // Calculate bump level from commits against base_version.
+            let pkg_config = self.req.get_package_config(&p.name);
+            let version_updater = pkg_config.generic.version_updater()?;
+            let next_from_commits =
+                version_updater.increment(&base_version, diff.commits.iter().map(|c| &c.message));
+            let own_bump = BumpLevel::compute(&base_version, &next_from_commits);
+
+            pass1.push(Pass1Entry {
+                package: p,
+                diff: diff.clone(),
+                own_bump,
+                base_version,
+            });
+        }
+
+        // ── Transitive propagation (topological order, leaves-first) ──
+        // Build a name → index map for the pass1 entries.
+        let name_to_idx: HashMap<&str, usize> = pass1
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (e.package.name.as_str(), i))
+            .collect();
+
+        // Topological sort: the packages in `self.project.publishable_packages()` are already
+        // in release order (dependencies before dependents) from `release_order()`.
+        // We process them in that order — leaves first.
+        let ordered_names: Vec<String> = self
+            .packages_to_process()
+            .iter()
+            .map(|p| p.name.to_string())
+            .collect();
+
+        // final_bumps stores the propagated bump level per package name.
+        let mut final_bumps: HashMap<&str, BumpLevel> = HashMap::new();
+
+        for pkg_name in &ordered_names {
+            if let Some(&idx) = name_to_idx.get(pkg_name.as_str()) {
+                let entry = &pass1[idx];
+                let package = entry.package;
+
+                // Find the max bump among workspace dependencies.
+                let max_dep_bump = package
+                    .dependencies
+                    .iter()
+                    .filter(|d| {
+                        matches!(
+                            d.kind,
+                            cargo_metadata::DependencyKind::Normal
+                                | cargo_metadata::DependencyKind::Build
+                        )
+                    })
+                    .filter_map(|d| final_bumps.get(d.name.as_str()))
+                    .copied()
+                    .max()
+                    .unwrap_or(BumpLevel::None);
+
+                let final_bump = entry.own_bump.max(max_dep_bump);
+                final_bumps.insert(pkg_name.as_str(), final_bump);
+            }
+        }
+
+        // ── Pass 2: compute final versions and generate changelogs ──
+        let mut old_changelogs = OldChangelogs::new();
+
+        for entry in pass1 {
+            let final_bump = final_bumps
+                .get(entry.package.name.as_str())
+                .copied()
+                .unwrap_or(BumpLevel::None);
+
+            if final_bump == BumpLevel::None && entry.diff.registry_package_exists {
+                // No bump needed — skip this package unless it's new.
+                continue;
+            }
+
+            let target_stable = if !entry.diff.registry_package_exists {
+                // New package — use its Cargo.toml version as-is.
+                entry.package.version.clone()
+            } else {
+                final_bump.apply(&entry.base_version)
+            };
+
+            let final_version = match release_mode {
+                ReleaseMode::Rc => {
+                    let rc_num = find_next_rc_number(
+                        self.project,
+                        &entry.package.name,
+                        &target_stable,
+                        repository,
+                    );
+                    let pre_str = format!("rc.{rc_num}");
+                    let pre = semver::Prerelease::new(&pre_str)
+                        .context("failed to create RC prerelease")?;
+                    Version {
+                        pre,
+                        ..target_stable
+                    }
+                }
+                ReleaseMode::Stable => target_stable,
+                ReleaseMode::Default => unreachable!(),
+            };
+
+            info!(
+                "{}: next version is {final_version} (base: {}, bump: {:?})",
+                entry.package.name, entry.base_version, final_bump
+            );
+
+            let update_result = self.calculate_update_result(
+                entry.diff.commits,
+                final_version,
+                entry.package,
+                entry.diff.semver_check,
+                entry.diff.registry_version,
+                &mut old_changelogs,
+            )?;
+            packages_to_update
+                .updates_mut()
+                .push((entry.package.clone(), update_result));
+        }
+
+        Ok(packages_to_update)
+    }
+
     /// Get the highest next version of all packages for each version group.
     fn get_version_groups(
         &self,
@@ -169,7 +364,8 @@ impl Updater<'_> {
             let pkg_config = self.req.get_package_config(&pkg.name);
             let version_updater = pkg_config.generic.version_updater()?;
             if let Some(version_group) = pkg_config.version_group {
-                let next_pkg_ver = pkg.version.next_from_diff(diff, version_updater);
+                let base = diff.base_version.as_ref().unwrap_or(&pkg.version);
+                let next_pkg_ver = base.next_from_diff(diff, version_updater);
                 match version_groups.entry(version_group.clone()) {
                     std::collections::hash_map::Entry::Occupied(v) => {
                         // maximum version of the group until now
@@ -204,7 +400,8 @@ impl Updater<'_> {
                 if *workspace_package == *p.name {
                     let pkg_config = self.req.get_package_config(&p.name);
                     let version_updater = pkg_config.generic.version_updater()?;
-                    let next = p.version.next_from_diff(diff, version_updater);
+                    let base = diff.base_version.as_ref().unwrap_or(&p.version);
+                    let next = base.next_from_diff(diff, version_updater);
                     if let Some(workspace_version) = &workspace_version
                         && &next >= workspace_version
                     {
@@ -570,10 +767,26 @@ impl Updater<'_> {
                 }
             })?;
 
-        let git_tag = self
-            .project
-            .git_tag(&package.name, &package.version.to_string())?;
-        let tag_commit = repository.get_tag_commit(&git_tag);
+        // Always diff from the last stable (non-RC) tag. This ensures that
+        // when the current version is e.g. 1.2.0-rc.1, we diff from the last
+        // stable tag (1.2.0) rather than the RC tag.
+        let (git_tag, tag_commit) =
+            if let Some(stable_info) =
+                find_last_stable_tag(self.project, &package.name, repository)
+            {
+                let tag = self
+                    .project
+                    .git_tag(&package.name, &stable_info.version.to_string())?;
+                diff.base_version = Some(stable_info.version);
+                (tag, Some(stable_info.commit))
+            } else {
+                // No stable tag found — fall back to constructing tag from package version.
+                let tag = self
+                    .project
+                    .git_tag(&package.name, &package.version.to_string())?;
+                let commit = repository.get_tag_commit(&tag);
+                (tag, commit)
+            };
 
         // Check if git_only is enabled for this package
         let using_git_only = || self.req.should_use_git_only(&package.name);
@@ -820,7 +1033,15 @@ impl Updater<'_> {
                         .clone()
                 } else {
                     let version_updater = pkg_config.generic.version_updater()?;
-                    p.version.next_from_diff(diff, version_updater)
+                    // When a stable base_version is available (e.g. the current
+                    // Cargo.toml version is an RC like 1.2.0-rc.1 but the last
+                    // stable tag is 1.2.0), compute the next version from the
+                    // stable base so that conventional-commit analysis isn't
+                    // short-circuited by the prerelease check.
+                    match &diff.base_version {
+                        Some(base) => base.next_from_diff(diff, version_updater),
+                        None => p.version.next_from_diff(diff, version_updater),
+                    }
                 }
             }
         };
@@ -849,8 +1070,9 @@ impl Updater<'_> {
         let Ok(package_files) = package_files_res.inspect_err(|e| {
             debug!("failed to get package files at commit {hash}: {e:?}");
         }) else {
-            // `cargo package` can fail if the package doesn't contain a Cargo.toml file yet.
-            return Ok(true);
+            // `cargo package` can fail if the package doesn't exist at this commit
+            // (e.g., no Cargo.toml yet). Don't collect the commit — it predates the package.
+            return Ok(false);
         };
         let Ok(changed_files) = repository.files_of_current_commit().inspect_err(|e| {
             warn!("failed to get changed files of commit {hash}: {e:?}");
@@ -1083,6 +1305,92 @@ fn get_repo_path(
     let result_path = repository.directory().join(relative_path);
 
     Ok(result_path)
+}
+
+/// Information about the last stable (non-RC) tag for a package.
+struct StableTagInfo {
+    /// The stable version parsed from the tag.
+    version: Version,
+    /// The commit hash pointed to by the tag.
+    commit: String,
+}
+
+/// Find the last stable (non-prerelease) tag for a package.
+///
+/// Scans all tags in the repository, matches them against the package's tag template,
+/// extracts versions, and returns the highest one that has no prerelease component.
+///
+/// Returns `None` if no stable tag is found.
+fn find_last_stable_tag(
+    project: &Project,
+    package_name: &str,
+    repository: &Repo,
+) -> Option<StableTagInfo> {
+    let all_tags = repository.get_all_tags();
+    if all_tags.is_empty() {
+        return None;
+    }
+
+    // Generate a tag with a known placeholder version to determine the prefix/suffix pattern.
+    let placeholder = "0.0.0-placeholder";
+    let rendered = project.git_tag(package_name, placeholder).ok()?;
+
+    let (prefix, suffix) = rendered.split_once(placeholder)?;
+
+    let mut best: Option<StableTagInfo> = None;
+
+    for tag in &all_tags {
+        if let Some(version_str) = tag
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_suffix(suffix))
+        {
+            if let Ok(version) = Version::parse(version_str) {
+                // Only consider stable (non-prerelease) versions.
+                if version.pre.is_empty() {
+                    let is_better = best.as_ref().is_none_or(|b| version > b.version);
+                    if is_better {
+                        if let Some(commit) = repository.get_tag_commit(tag) {
+                            best = Some(StableTagInfo { version, commit });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    best
+}
+
+/// Find the next RC number for a given package and target stable version.
+///
+/// Scans all tags for patterns like `pkg-v{target}-rc.N` and returns `max(N) + 1`.
+/// Returns 1 if no existing RC tags are found.
+fn find_next_rc_number(
+    project: &Project,
+    package_name: &str,
+    target_stable: &Version,
+    repository: &Repo,
+) -> u64 {
+    let all_tags = repository.get_all_tags();
+
+    // Build the expected tag prefix for this target version's RCs.
+    // E.g. for target 1.1.0, we look for tags like "pkg-v1.1.0-rc.N"
+    let rc_prefix_version = format!("{target_stable}-rc.");
+    let rendered = project
+        .git_tag(package_name, &rc_prefix_version)
+        .unwrap_or_default();
+
+    // rendered is something like "pkg-v1.1.0-rc." — we look for tags that start with this
+    let mut max_rc: u64 = 0;
+    for tag in &all_tags {
+        if let Some(rc_num_str) = tag.strip_prefix(&rendered) {
+            if let Ok(n) = rc_num_str.parse::<u64>() {
+                max_rc = max_rc.max(n);
+            }
+        }
+    }
+
+    max_rc + 1
 }
 
 #[cfg(test)]

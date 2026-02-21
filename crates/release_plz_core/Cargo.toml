@@ -56,6 +56,12 @@ tera.workspace = true
 http.workspace = true
 urlencoding.workspace = true
 git2 = "0.20.2"
+camino.workspace = true
+tracing-subscriber.workspace = true
+
+[[bin]]
+name = "diff_debug"
+path = "src/bin/diff_debug.rs"
 
 [dev-dependencies]
 git_cmd = { path = "../git_cmd", features = ["test_fixture"] }

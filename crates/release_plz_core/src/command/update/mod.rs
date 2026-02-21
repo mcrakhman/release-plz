@@ -22,6 +22,7 @@ use tracing::{debug, instrument};
 
 pub use packages_update::*;
 pub use update_config::*;
+pub use update_request::ReleaseMode;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct ReleaseInfo {

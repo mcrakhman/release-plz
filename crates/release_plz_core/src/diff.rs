@@ -21,6 +21,9 @@ pub(crate) struct Diff {
     /// Used to generate correct version transitions in PR body (e.g., "0.1.0 -> 0.2.0")
     /// and correct compare URLs in changelogs.
     pub registry_version: Option<Version>,
+    /// The last stable (non-RC) version for this package.
+    /// Set when `ReleaseMode` is `Rc` or `Stable`; `None` for `Default` mode.
+    pub base_version: Option<Version>,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Default)]
@@ -67,6 +70,7 @@ impl Diff {
             is_version_published: true,
             semver_check: SemverCheck::Skipped,
             registry_version: None,
+            base_version: None,
         }
     }
 

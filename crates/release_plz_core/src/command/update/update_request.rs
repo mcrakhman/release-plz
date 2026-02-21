@@ -16,6 +16,26 @@ use super::update_config::{PackageUpdateConfig, UpdateConfig};
 
 pub const DEFAULT_MAX_ANALYZE_COMMITS: u32 = 1000;
 
+/// Controls how release-plz calculates versions.
+///
+/// - `Default`: existing behavior — diff from the tag matching `Cargo.toml`'s current version.
+/// - `Rc`: diff from the last **stable** (non-RC) tag, propagate the MAX bump level through
+///   workspace dependencies, and append a `-rc.N` suffix to the computed version.
+/// - `Stable`: same baseline and propagation as `Rc`, but produce a final stable version
+///   (no pre-release suffix).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ReleaseMode {
+    /// Existing behavior — no change from current release-plz semantics.
+    #[default]
+    Default,
+    /// Release-candidate mode: diff from last stable tag, propagate bump levels,
+    /// and append `-rc.N` suffix.
+    Rc,
+    /// Stable mode: diff from last stable tag and propagate bump levels,
+    /// but produce a final stable version (no pre-release suffix).
+    Stable,
+}
+
 #[derive(Debug, Clone)]
 pub struct UpdateRequest {
     /// The manifest of the project you want to update.
@@ -48,6 +68,8 @@ pub struct UpdateRequest {
     release_commits: Option<Regex>,
     git: Option<GitForge>,
     max_analyze_commits: Option<u32>,
+    /// Controls version calculation strategy (default, RC, or stable).
+    release_mode: ReleaseMode,
 }
 
 impl UpdateRequest {
@@ -68,6 +90,7 @@ impl UpdateRequest {
             release_commits: None,
             git: None,
             max_analyze_commits: None,
+            release_mode: ReleaseMode::Default,
         })
     }
 
@@ -120,6 +143,17 @@ impl UpdateRequest {
             max_analyze_commits: max_commits,
             ..self
         }
+    }
+
+    pub fn with_release_mode(self, release_mode: ReleaseMode) -> Self {
+        Self {
+            release_mode,
+            ..self
+        }
+    }
+
+    pub fn release_mode(&self) -> ReleaseMode {
+        self.release_mode
     }
 
     pub fn with_registry_manifest_path(self, registry_manifest: &Utf8Path) -> anyhow::Result<Self> {
