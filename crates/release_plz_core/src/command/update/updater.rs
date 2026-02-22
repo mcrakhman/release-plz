@@ -1115,7 +1115,10 @@ fn get_package_files(
 ) -> anyhow::Result<HashSet<Utf8PathBuf>> {
     // Get relative path of the crate with respect to the repository because we need to compare
     // files with the git output.
-    let repository_dir = repository.directory();
+    // Canonicalize repository_dir so it matches the canonicalized file paths below.
+    // Without this, symlinks in the temp directory path (e.g. /tmp -> /private/tmp on macOS)
+    // cause strip_prefix to fail.
+    let repository_dir = fs_utils::canonicalize_utf8(repository.directory())?;
 
     crate::get_cargo_package_files(package_path)?
         .into_iter()
@@ -1126,7 +1129,7 @@ fn get_package_files(
             let file_path = package_path.join(file);
             let normalized = fs_utils::canonicalize_utf8(&file_path)?;
             let relative_path = normalized
-                .strip_prefix(repository_dir)
+                .strip_prefix(&repository_dir)
                 .with_context(|| format!("failed to strip {repository_dir} from {normalized}"))?;
             Ok(relative_path.to_path_buf())
         })
