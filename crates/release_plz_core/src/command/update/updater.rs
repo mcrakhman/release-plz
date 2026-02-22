@@ -1093,7 +1093,7 @@ impl Updater<'_> {
             debug!("failed to get package files at commit {hash}: {e:?}");
         }) else {
             // `cargo package` can fail if the package doesn't contain a Cargo.toml file yet.
-            return Ok(true);
+            return Ok(false);
         };
         let Ok(changed_files) = repository.files_of_current_commit().inspect_err(|e| {
             warn!("failed to get changed files of commit {hash}: {e:?}");
