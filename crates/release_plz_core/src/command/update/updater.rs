@@ -66,7 +66,7 @@ impl Updater<'_> {
 
         match self.req.release_mode() {
             ReleaseMode::Rc | ReleaseMode::Stable => {
-                self.packages_to_update_rc_stable(packages_diffs, repository)
+                self.packages_to_update_rc_stable(&packages_diffs, repository)
             }
             ReleaseMode::Default => {
                 self.packages_to_update_default(
@@ -183,7 +183,7 @@ impl Updater<'_> {
     /// RC/Stable mode: two-pass version calculation with transitive bump propagation.
     fn packages_to_update_rc_stable(
         &self,
-        packages_diffs: Vec<(&Package, Diff)>,
+        packages_diffs: &[(&Package, Diff)],
         repository: &Repo,
     ) -> anyhow::Result<PackagesUpdate> {
         let release_mode = self.req.release_mode();
@@ -200,22 +200,12 @@ impl Updater<'_> {
 
         let mut pass1: Vec<Pass1Entry<'_>> = Vec::new();
 
-        for (p, diff) in &packages_diffs {
+        for (p, diff) in packages_diffs {
             let base_version = match &diff.base_version {
                 Some(v) => v.clone(),
                 // No stable tag found — use current version as base.
                 None => p.version.clone(),
             };
-
-            debug!(
-                "{}: RC pass1 — cargo_ver={}, base_ver={}, commits={}, registry_exists={}, is_published={}",
-                p.name, p.version, base_version,
-                diff.commits.len(), diff.registry_package_exists, diff.is_version_published
-            );
-            for (i, c) in diff.commits.iter().enumerate() {
-                let first_line = c.message.lines().next().unwrap_or("");
-                debug!("  {}: commit[{i}] id={} msg={first_line:?}", p.name, &c.id[..7.min(c.id.len())]);
-            }
 
             if diff.commits.is_empty() && diff.registry_package_exists {
                 // No own commits — own_bump is None, but we still track it
@@ -247,8 +237,6 @@ impl Updater<'_> {
                 version_updater.increment(&base_version, diff.commits.iter().map(|c| &c.message));
             let own_bump = BumpLevel::compute(&base_version, &next_from_commits);
 
-            debug!("{}: own_bump={:?} (next_from_commits={})", p.name, own_bump, next_from_commits);
-
             pass1.push(Pass1Entry {
                 package: p,
                 diff: diff.clone(),
@@ -273,7 +261,7 @@ impl Updater<'_> {
                                 | cargo_metadata::DependencyKind::Build
                         )
                     })
-                    .map(|d| d.name.to_string())
+                    .map(|d| String::from(d.name.as_str()))
                     .collect();
                 (e.package.name.to_string(), e.own_bump, dep_names)
             })
@@ -289,11 +277,6 @@ impl Updater<'_> {
 
         let final_bumps = propagate_bumps(&prop_entries, &ordered_names);
 
-        debug!("RC propagation results:");
-        for (name, bump) in &final_bumps {
-            debug!("  {name}: final_bump={bump:?}");
-        }
-
         // ── Pass 2: compute final versions and generate changelogs ──
         let mut old_changelogs = OldChangelogs::new();
 
@@ -305,15 +288,14 @@ impl Updater<'_> {
 
             if final_bump == BumpLevel::None && entry.diff.registry_package_exists {
                 // No bump needed — skip this package unless it's new.
-                debug!("{}: skipped (no bump, registry exists)", entry.package.name);
                 continue;
             }
 
-            let target_stable = if !entry.diff.registry_package_exists {
+            let target_stable = if entry.diff.registry_package_exists {
+                final_bump.apply(&entry.base_version)
+            } else {
                 // New package — use its Cargo.toml version as-is.
                 entry.package.version.clone()
-            } else {
-                final_bump.apply(&entry.base_version)
             };
 
             let final_version = match release_mode {
@@ -336,9 +318,9 @@ impl Updater<'_> {
                 ReleaseMode::Default => unreachable!(),
             };
 
-            debug!(
-                "{}: next version is {final_version} (base: {}, bump: {:?})",
-                entry.package.name, entry.base_version, final_bump
+            info!(
+                "{}: {} -> {}",
+                entry.package.name, entry.base_version, final_version
             );
 
             let update_result = self.calculate_update_result(
@@ -687,14 +669,9 @@ impl Updater<'_> {
 
         let changelog_outcome = {
             let cfg = self.req.get_package_config(package.name.as_str());
-            let should_update = cfg.should_update_changelog();
-            let changelog_req = should_update
+            let changelog_req = cfg
+                .should_update_changelog()
                 .then_some(self.req.changelog_req().clone());
-            debug!(
-                "{}: changelog generation — should_update={}, commits_in={}, old_changelog_len={}",
-                package.name, should_update, commits.len(),
-                old_changelog.map(|c| c.len()).unwrap_or(0)
-            );
             let commits: Vec<Commit> = commits
                 .into_iter()
                 // If not conventional commit, only consider the first line of the commit message.
@@ -709,10 +686,6 @@ impl Updater<'_> {
                     }
                 })
                 .collect();
-            debug!("{}: commits after filter: {}", package.name, commits.len());
-            for (i, c) in commits.iter().enumerate() {
-                debug!("  {}: filtered_commit[{i}] msg={:?}", package.name, &c.message);
-            }
             changelog_req
                 .map(|r| {
                     get_changelog(
@@ -729,17 +702,8 @@ impl Updater<'_> {
         }?;
 
         let (changelog, new_changelog_entry) = match changelog_outcome {
-            Some((changelog, new_changelog_entry)) => {
-                debug!(
-                    "{}: changelog generated — entry_len={}",
-                    package.name, new_changelog_entry.len()
-                );
-                (Some(changelog), Some(new_changelog_entry))
-            }
-            None => {
-                debug!("{}: no changelog generated (changelog_req was None)", package.name);
-                (None, None)
-            }
+            Some((changelog, new_changelog_entry)) => (Some(changelog), Some(new_changelog_entry)),
+            None => (None, None),
         };
 
         Ok(UpdateResult {
@@ -809,6 +773,13 @@ impl Updater<'_> {
                 let commit = repository.get_tag_commit(&tag);
                 (tag, commit)
             };
+
+        info!(
+            "{}: diffing from tag {} (commit {})",
+            package.name,
+            git_tag,
+            tag_commit.as_deref().unwrap_or("none")
+        );
 
         // Check if git_only is enabled for this package
         let using_git_only = || self.req.should_use_git_only(&package.name);
@@ -927,9 +898,10 @@ impl Updater<'_> {
                         diff.set_version_unpublished(registry_package.package.version.clone());
                     }
                     if are_changed_files_in_pkg()? {
-                        debug!("packages contain different files");
                         // At this point of the git history, the two packages are different,
                         // which means that this commit is not present in the published package.
+                        let first_line = current_commit_message.lines().next().unwrap_or("");
+                        info!("{}: commit {} {}", package.name, &current_commit_hash[..7.min(current_commit_hash.len())], first_line);
                         diff.commits.push(Commit::new(
                             current_commit_hash,
                             current_commit_message.clone(),
@@ -937,6 +909,8 @@ impl Updater<'_> {
                     }
                 }
             } else if are_changed_files_in_pkg()? {
+                let first_line = current_commit_message.lines().next().unwrap_or("");
+                info!("{}: commit {} {}", package.name, &current_commit_hash[..7.min(current_commit_hash.len())], first_line);
                 diff.commits.push(Commit::new(
                     current_commit_hash,
                     current_commit_message.clone(),
@@ -1361,56 +1335,21 @@ fn find_last_stable_tag(
     repository: &Repo,
 ) -> Option<StableTagInfo> {
     let all_tags = repository.get_all_tags();
-    debug!(
-        "{}: find_last_stable_tag — total tags in repo: {}",
-        package_name,
-        all_tags.len()
-    );
     if all_tags.is_empty() {
-        debug!("{}: no tags found, returning None", package_name);
         return None;
     }
 
     // Generate a tag with a known placeholder version to determine the prefix/suffix pattern.
     let placeholder = "0.0.0-placeholder";
-    let rendered = match project.git_tag(package_name, placeholder) {
-        Ok(r) => r,
-        Err(e) => {
-            debug!("{}: git_tag render failed: {e}", package_name);
-            return None;
-        }
+    let Ok(rendered) = project.git_tag(package_name, placeholder) else {
+        return None;
     };
 
-    let (prefix, suffix) = match rendered.split_once(placeholder) {
-        Some(ps) => ps,
-        None => {
-            debug!(
-                "{}: rendered tag {:?} doesn't contain placeholder",
-                package_name, rendered
-            );
-            return None;
-        }
-    };
-    debug!(
-        "{}: tag pattern prefix={:?} suffix={:?}",
-        package_name, prefix, suffix
-    );
+    let (prefix, suffix) = rendered.split_once(placeholder)?;
 
-    // Show a few matching tags for debug
-    let matching_tags: Vec<&String> = all_tags
-        .iter()
-        .filter(|t| t.starts_with(prefix))
-        .take(5)
-        .collect();
-    debug!("{}: matching tags (first 5): {:?}", package_name, matching_tags);
-
-    let version = best_stable_version_from_tags(&all_tags, prefix, suffix);
-    debug!("{}: best_stable_version = {:?}", package_name, version);
-    let version = version?;
+    let version = best_stable_version_from_tags(&all_tags, prefix, suffix)?;
     let tag = project.git_tag(package_name, &version.to_string()).ok()?;
-    let commit = repository.get_tag_commit(&tag);
-    debug!("{}: tag={:?} commit={:?}", package_name, tag, commit);
-    let commit = commit?;
+    let commit = repository.get_tag_commit(&tag)?;
     Some(StableTagInfo { version, commit })
 }
 
