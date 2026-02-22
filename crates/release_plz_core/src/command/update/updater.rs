@@ -207,6 +207,16 @@ impl Updater<'_> {
                 None => p.version.clone(),
             };
 
+            debug!(
+                "{}: RC pass1 — cargo_ver={}, base_ver={}, commits={}, registry_exists={}, is_published={}",
+                p.name, p.version, base_version,
+                diff.commits.len(), diff.registry_package_exists, diff.is_version_published
+            );
+            for (i, c) in diff.commits.iter().enumerate() {
+                let first_line = c.message.lines().next().unwrap_or("");
+                debug!("  {}: commit[{i}] id={} msg={first_line:?}", p.name, &c.id[..7.min(c.id.len())]);
+            }
+
             if diff.commits.is_empty() && diff.registry_package_exists {
                 // No own commits — own_bump is None, but we still track it
                 // for potential dependency-triggered bumps.
@@ -237,6 +247,8 @@ impl Updater<'_> {
                 version_updater.increment(&base_version, diff.commits.iter().map(|c| &c.message));
             let own_bump = BumpLevel::compute(&base_version, &next_from_commits);
 
+            debug!("{}: own_bump={:?} (next_from_commits={})", p.name, own_bump, next_from_commits);
+
             pass1.push(Pass1Entry {
                 package: p,
                 diff: diff.clone(),
@@ -246,32 +258,12 @@ impl Updater<'_> {
         }
 
         // ── Transitive propagation (topological order, leaves-first) ──
-        // Build a name → index map for the pass1 entries.
-        let name_to_idx: HashMap<&str, usize> = pass1
+        // Build entries for the propagation function.
+        let prop_entries: Vec<(String, BumpLevel, Vec<String>)> = pass1
             .iter()
-            .enumerate()
-            .map(|(i, e)| (e.package.name.as_str(), i))
-            .collect();
-
-        // Topological sort: the packages in `self.project.publishable_packages()` are already
-        // in release order (dependencies before dependents) from `release_order()`.
-        // We process them in that order — leaves first.
-        let ordered_names: Vec<String> = self
-            .packages_to_process()
-            .iter()
-            .map(|p| p.name.to_string())
-            .collect();
-
-        // final_bumps stores the propagated bump level per package name.
-        let mut final_bumps: HashMap<&str, BumpLevel> = HashMap::new();
-
-        for pkg_name in &ordered_names {
-            if let Some(&idx) = name_to_idx.get(pkg_name.as_str()) {
-                let entry = &pass1[idx];
-                let package = entry.package;
-
-                // Find the max bump among workspace dependencies.
-                let max_dep_bump = package
+            .map(|e| {
+                let dep_names = e
+                    .package
                     .dependencies
                     .iter()
                     .filter(|d| {
@@ -281,14 +273,25 @@ impl Updater<'_> {
                                 | cargo_metadata::DependencyKind::Build
                         )
                     })
-                    .filter_map(|d| final_bumps.get(d.name.as_str()))
-                    .copied()
-                    .max()
-                    .unwrap_or(BumpLevel::None);
+                    .map(|d| d.name.to_string())
+                    .collect();
+                (e.package.name.to_string(), e.own_bump, dep_names)
+            })
+            .collect();
 
-                let final_bump = entry.own_bump.max(max_dep_bump);
-                final_bumps.insert(pkg_name.as_str(), final_bump);
-            }
+        // Topological sort: the packages in `self.project.publishable_packages()` are already
+        // in release order (dependencies before dependents) from `release_order()`.
+        let ordered_names: Vec<String> = self
+            .packages_to_process()
+            .iter()
+            .map(|p| p.name.to_string())
+            .collect();
+
+        let final_bumps = propagate_bumps(&prop_entries, &ordered_names);
+
+        debug!("RC propagation results:");
+        for (name, bump) in &final_bumps {
+            debug!("  {name}: final_bump={bump:?}");
         }
 
         // ── Pass 2: compute final versions and generate changelogs ──
@@ -302,6 +305,7 @@ impl Updater<'_> {
 
             if final_bump == BumpLevel::None && entry.diff.registry_package_exists {
                 // No bump needed — skip this package unless it's new.
+                debug!("{}: skipped (no bump, registry exists)", entry.package.name);
                 continue;
             }
 
@@ -332,7 +336,7 @@ impl Updater<'_> {
                 ReleaseMode::Default => unreachable!(),
             };
 
-            info!(
+            debug!(
                 "{}: next version is {final_version} (base: {}, bump: {:?})",
                 entry.package.name, entry.base_version, final_bump
             );
@@ -683,9 +687,14 @@ impl Updater<'_> {
 
         let changelog_outcome = {
             let cfg = self.req.get_package_config(package.name.as_str());
-            let changelog_req = cfg
-                .should_update_changelog()
+            let should_update = cfg.should_update_changelog();
+            let changelog_req = should_update
                 .then_some(self.req.changelog_req().clone());
+            debug!(
+                "{}: changelog generation — should_update={}, commits_in={}, old_changelog_len={}",
+                package.name, should_update, commits.len(),
+                old_changelog.map(|c| c.len()).unwrap_or(0)
+            );
             let commits: Vec<Commit> = commits
                 .into_iter()
                 // If not conventional commit, only consider the first line of the commit message.
@@ -700,6 +709,10 @@ impl Updater<'_> {
                     }
                 })
                 .collect();
+            debug!("{}: commits after filter: {}", package.name, commits.len());
+            for (i, c) in commits.iter().enumerate() {
+                debug!("  {}: filtered_commit[{i}] msg={:?}", package.name, &c.message);
+            }
             changelog_req
                 .map(|r| {
                     get_changelog(
@@ -716,8 +729,17 @@ impl Updater<'_> {
         }?;
 
         let (changelog, new_changelog_entry) = match changelog_outcome {
-            Some((changelog, new_changelog_entry)) => (Some(changelog), Some(new_changelog_entry)),
-            None => (None, None),
+            Some((changelog, new_changelog_entry)) => {
+                debug!(
+                    "{}: changelog generated — entry_len={}",
+                    package.name, new_changelog_entry.len()
+                );
+                (Some(changelog), Some(new_changelog_entry))
+            }
+            None => {
+                debug!("{}: no changelog generated (changelog_req was None)", package.name);
+                (None, None)
+            }
         };
 
         Ok(UpdateResult {
@@ -1070,9 +1092,8 @@ impl Updater<'_> {
         let Ok(package_files) = package_files_res.inspect_err(|e| {
             debug!("failed to get package files at commit {hash}: {e:?}");
         }) else {
-            // `cargo package` can fail if the package doesn't exist at this commit
-            // (e.g., no Cargo.toml yet). Don't collect the commit — it predates the package.
-            return Ok(false);
+            // `cargo package` can fail if the package doesn't contain a Cargo.toml file yet.
+            return Ok(true);
         };
         let Ok(changed_files) = repository.files_of_current_commit().inspect_err(|e| {
             warn!("failed to get changed files of commit {hash}: {e:?}");
@@ -1315,6 +1336,19 @@ struct StableTagInfo {
     commit: String,
 }
 
+/// Given all tags and the prefix/suffix pattern from the tag template,
+/// find the highest stable (non-prerelease) version.
+fn best_stable_version_from_tags(tags: &[String], prefix: &str, suffix: &str) -> Option<Version> {
+    tags.iter()
+        .filter_map(|tag| {
+            tag.strip_prefix(prefix)
+                .and_then(|rest| rest.strip_suffix(suffix))
+        })
+        .filter_map(|v| Version::parse(v).ok())
+        .filter(|v| v.pre.is_empty())
+        .max()
+}
+
 /// Find the last stable (non-prerelease) tag for a package.
 ///
 /// Scans all tags in the repository, matches them against the package's tag template,
@@ -1327,38 +1361,67 @@ fn find_last_stable_tag(
     repository: &Repo,
 ) -> Option<StableTagInfo> {
     let all_tags = repository.get_all_tags();
+    debug!(
+        "{}: find_last_stable_tag — total tags in repo: {}",
+        package_name,
+        all_tags.len()
+    );
     if all_tags.is_empty() {
+        debug!("{}: no tags found, returning None", package_name);
         return None;
     }
 
     // Generate a tag with a known placeholder version to determine the prefix/suffix pattern.
     let placeholder = "0.0.0-placeholder";
-    let rendered = project.git_tag(package_name, placeholder).ok()?;
-
-    let (prefix, suffix) = rendered.split_once(placeholder)?;
-
-    let mut best: Option<StableTagInfo> = None;
-
-    for tag in &all_tags {
-        if let Some(version_str) = tag
-            .strip_prefix(prefix)
-            .and_then(|rest| rest.strip_suffix(suffix))
-        {
-            if let Ok(version) = Version::parse(version_str) {
-                // Only consider stable (non-prerelease) versions.
-                if version.pre.is_empty() {
-                    let is_better = best.as_ref().is_none_or(|b| version > b.version);
-                    if is_better {
-                        if let Some(commit) = repository.get_tag_commit(tag) {
-                            best = Some(StableTagInfo { version, commit });
-                        }
-                    }
-                }
-            }
+    let rendered = match project.git_tag(package_name, placeholder) {
+        Ok(r) => r,
+        Err(e) => {
+            debug!("{}: git_tag render failed: {e}", package_name);
+            return None;
         }
-    }
+    };
 
-    best
+    let (prefix, suffix) = match rendered.split_once(placeholder) {
+        Some(ps) => ps,
+        None => {
+            debug!(
+                "{}: rendered tag {:?} doesn't contain placeholder",
+                package_name, rendered
+            );
+            return None;
+        }
+    };
+    debug!(
+        "{}: tag pattern prefix={:?} suffix={:?}",
+        package_name, prefix, suffix
+    );
+
+    // Show a few matching tags for debug
+    let matching_tags: Vec<&String> = all_tags
+        .iter()
+        .filter(|t| t.starts_with(prefix))
+        .take(5)
+        .collect();
+    debug!("{}: matching tags (first 5): {:?}", package_name, matching_tags);
+
+    let version = best_stable_version_from_tags(&all_tags, prefix, suffix);
+    debug!("{}: best_stable_version = {:?}", package_name, version);
+    let version = version?;
+    let tag = project.git_tag(package_name, &version.to_string()).ok()?;
+    let commit = repository.get_tag_commit(&tag);
+    debug!("{}: tag={:?} commit={:?}", package_name, tag, commit);
+    let commit = commit?;
+    Some(StableTagInfo { version, commit })
+}
+
+/// Given all tags and a rendered RC prefix (e.g. "pkg-v1.1.0-rc."),
+/// find the highest existing RC number. Returns 0 if none found.
+fn max_rc_number_from_tags(tags: &[String], rc_tag_prefix: &str) -> u64 {
+    tags.iter()
+        .filter_map(|tag| tag.strip_prefix(rc_tag_prefix))
+        .filter_map(|n| n.parse::<u64>().ok())
+        .max()
+        .unwrap_or(0)
 }
 
 /// Find the next RC number for a given package and target stable version.
@@ -1380,17 +1443,46 @@ fn find_next_rc_number(
         .git_tag(package_name, &rc_prefix_version)
         .unwrap_or_default();
 
-    // rendered is something like "pkg-v1.1.0-rc." — we look for tags that start with this
-    let mut max_rc: u64 = 0;
-    for tag in &all_tags {
-        if let Some(rc_num_str) = tag.strip_prefix(&rendered) {
-            if let Ok(n) = rc_num_str.parse::<u64>() {
-                max_rc = max_rc.max(n);
-            }
+    max_rc_number_from_tags(&all_tags, &rendered) + 1
+}
+
+/// Propagate bump levels through the dependency graph.
+///
+/// `entries`: `(package_name, own_bump, dependency_names)` for each package in the workspace.
+/// `ordered_names`: topologically sorted package names (leaves first).
+///
+/// Returns a map from package name to final (propagated) bump level.
+fn propagate_bumps(
+    entries: &[(String, BumpLevel, Vec<String>)],
+    ordered_names: &[String],
+) -> HashMap<String, BumpLevel> {
+    let name_to_bump: HashMap<&str, BumpLevel> = entries
+        .iter()
+        .map(|(name, bump, _)| (name.as_str(), *bump))
+        .collect();
+    let name_to_deps: HashMap<&str, &Vec<String>> = entries
+        .iter()
+        .map(|(name, _, deps)| (name.as_str(), deps))
+        .collect();
+
+    let mut final_bumps: HashMap<String, BumpLevel> = HashMap::new();
+
+    for pkg_name in ordered_names {
+        if let Some(&own_bump) = name_to_bump.get(pkg_name.as_str()) {
+            let max_dep_bump = name_to_deps
+                .get(pkg_name.as_str())
+                .into_iter()
+                .flat_map(|deps| deps.iter())
+                .filter_map(|d| final_bumps.get(d.as_str()))
+                .copied()
+                .max()
+                .unwrap_or(BumpLevel::None);
+
+            final_bumps.insert(pkg_name.clone(), own_bump.max(max_dep_bump));
         }
     }
 
-    max_rc + 1
+    final_bumps
 }
 
 #[cfg(test)]
@@ -1426,5 +1518,164 @@ mod tests {
         )
         .unwrap();
         assert_eq!(old, new.0);
+    }
+
+    // ── best_stable_version_from_tags tests ─────────────────────────
+
+    fn tags(strs: &[&str]) -> Vec<String> {
+        strs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn stable_tag_found_among_rc_tags() {
+        let t = tags(&[
+            "pkg-v1.0.0",
+            "pkg-v1.1.0-rc.1",
+            "pkg-v1.1.0-rc.2",
+        ]);
+        assert_eq!(
+            best_stable_version_from_tags(&t, "pkg-v", ""),
+            Some(Version::new(1, 0, 0))
+        );
+    }
+
+    #[test]
+    fn highest_stable_selected() {
+        let t = tags(&["pkg-v1.0.0", "pkg-v1.1.0", "pkg-v0.9.0"]);
+        assert_eq!(
+            best_stable_version_from_tags(&t, "pkg-v", ""),
+            Some(Version::new(1, 1, 0))
+        );
+    }
+
+    #[test]
+    fn no_stable_tags_returns_none() {
+        let t = tags(&["pkg-v1.0.0-rc.1", "pkg-v1.0.0-rc.2"]);
+        assert_eq!(best_stable_version_from_tags(&t, "pkg-v", ""), None);
+    }
+
+    #[test]
+    fn empty_tags_returns_none() {
+        assert_eq!(best_stable_version_from_tags(&[], "pkg-v", ""), None);
+    }
+
+    #[test]
+    fn non_matching_tags_ignored() {
+        let t = tags(&["other-v1.0.0", "pkg-v0.5.0", "unrelated"]);
+        assert_eq!(
+            best_stable_version_from_tags(&t, "pkg-v", ""),
+            Some(Version::new(0, 5, 0))
+        );
+    }
+
+    // ── max_rc_number_from_tags tests ───────────────────────────────
+
+    #[test]
+    fn finds_max_rc() {
+        let t = tags(&[
+            "pkg-v1.1.0-rc.1",
+            "pkg-v1.1.0-rc.3",
+            "pkg-v1.1.0-rc.2",
+        ]);
+        assert_eq!(max_rc_number_from_tags(&t, "pkg-v1.1.0-rc."), 3);
+    }
+
+    #[test]
+    fn no_rc_tags_returns_zero() {
+        assert_eq!(max_rc_number_from_tags(&[], "pkg-v1.1.0-rc."), 0);
+    }
+
+    #[test]
+    fn different_version_rc_ignored() {
+        let t = tags(&["pkg-v1.0.0-rc.5", "pkg-v1.0.0-rc.3"]);
+        // Looking for 1.1.0 RCs, but only 1.0.0 RCs exist.
+        assert_eq!(max_rc_number_from_tags(&t, "pkg-v1.1.0-rc."), 0);
+    }
+
+    #[test]
+    fn non_numeric_suffix_ignored() {
+        let t = tags(&[
+            "pkg-v1.1.0-rc.2",
+            "pkg-v1.1.0-rc.beta",
+            "pkg-v1.1.0-rc.3",
+        ]);
+        assert_eq!(max_rc_number_from_tags(&t, "pkg-v1.1.0-rc."), 3);
+    }
+
+    // ── propagate_bumps tests ───────────────────────────────────────
+
+    #[test]
+    fn dep_bump_propagates_to_parent() {
+        // B has major bump, A depends on B with no own bump → A gets major.
+        let entries = vec![
+            ("b".into(), BumpLevel::Major, vec![]),
+            ("a".into(), BumpLevel::None, vec!["b".into()]),
+        ];
+        let order = vec!["b".into(), "a".into()];
+        let result = propagate_bumps(&entries, &order);
+        assert_eq!(result["a"], BumpLevel::Major);
+        assert_eq!(result["b"], BumpLevel::Major);
+    }
+
+    #[test]
+    fn own_bump_wins_when_higher() {
+        // A has major, depends on B with patch → A stays major.
+        let entries = vec![
+            ("b".into(), BumpLevel::Patch, vec![]),
+            ("a".into(), BumpLevel::Major, vec!["b".into()]),
+        ];
+        let order = vec!["b".into(), "a".into()];
+        let result = propagate_bumps(&entries, &order);
+        assert_eq!(result["a"], BumpLevel::Major);
+        assert_eq!(result["b"], BumpLevel::Patch);
+    }
+
+    #[test]
+    fn transitive_chain() {
+        // C has minor, B depends on C (no own bump), A depends on B (no own bump).
+        // All should get minor through transitive propagation.
+        let entries = vec![
+            ("c".into(), BumpLevel::Minor, vec![]),
+            ("b".into(), BumpLevel::None, vec!["c".into()]),
+            ("a".into(), BumpLevel::None, vec!["b".into()]),
+        ];
+        let order = vec!["c".into(), "b".into(), "a".into()];
+        let result = propagate_bumps(&entries, &order);
+        assert_eq!(result["c"], BumpLevel::Minor);
+        assert_eq!(result["b"], BumpLevel::Minor);
+        assert_eq!(result["a"], BumpLevel::Minor);
+    }
+
+    #[test]
+    fn no_deps_preserves_own_bump() {
+        let entries = vec![("a".into(), BumpLevel::Patch, vec![])];
+        let order = vec!["a".into()];
+        let result = propagate_bumps(&entries, &order);
+        assert_eq!(result["a"], BumpLevel::Patch);
+    }
+
+    #[test]
+    fn multiple_deps_takes_max() {
+        // A depends on B(patch) and C(major) → A gets major.
+        let entries = vec![
+            ("b".into(), BumpLevel::Patch, vec![]),
+            ("c".into(), BumpLevel::Major, vec![]),
+            ("a".into(), BumpLevel::None, vec!["b".into(), "c".into()]),
+        ];
+        let order = vec!["b".into(), "c".into(), "a".into()];
+        let result = propagate_bumps(&entries, &order);
+        assert_eq!(result["a"], BumpLevel::Major);
+    }
+
+    #[test]
+    fn all_none_stays_none() {
+        let entries = vec![
+            ("b".into(), BumpLevel::None, vec![]),
+            ("a".into(), BumpLevel::None, vec!["b".into()]),
+        ];
+        let order = vec!["b".into(), "a".into()];
+        let result = propagate_bumps(&entries, &order);
+        assert_eq!(result["a"], BumpLevel::None);
+        assert_eq!(result["b"], BumpLevel::None);
     }
 }
