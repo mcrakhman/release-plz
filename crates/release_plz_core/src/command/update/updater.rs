@@ -38,7 +38,8 @@ use crate::{
 use crate::version::BumpLevel;
 
 use super::{
-    PackagesToUpdate, PackagesUpdate, package_dependencies::PackageDependencies as _,
+    PackagesToUpdate, PackagesUpdate,
+    package_dependencies::PackageDependencies as _,
     update_request::{ReleaseMode, UpdateRequest},
 };
 
@@ -69,10 +70,7 @@ impl Updater<'_> {
                 self.packages_to_update_rc_stable(&packages_diffs, repository)
             }
             ReleaseMode::Default => {
-                self.packages_to_update_default(
-                    packages_diffs,
-                    local_manifest_path,
-                )
+                self.packages_to_update_default(packages_diffs, local_manifest_path)
             }
         }
     }
@@ -756,23 +754,22 @@ impl Updater<'_> {
         // Always diff from the last stable (non-RC) tag. This ensures that
         // when the current version is e.g. 1.2.0-rc.1, we diff from the last
         // stable tag (1.2.0) rather than the RC tag.
-        let (git_tag, tag_commit) =
-            if let Some(stable_info) =
-                find_last_stable_tag(self.project, &package.name, repository)
-            {
-                let tag = self
-                    .project
-                    .git_tag(&package.name, &stable_info.version.to_string())?;
-                diff.base_version = Some(stable_info.version);
-                (tag, Some(stable_info.commit))
-            } else {
-                // No stable tag found — fall back to constructing tag from package version.
-                let tag = self
-                    .project
-                    .git_tag(&package.name, &package.version.to_string())?;
-                let commit = repository.get_tag_commit(&tag);
-                (tag, commit)
-            };
+        let (git_tag, tag_commit) = if let Some(stable_info) =
+            find_last_stable_tag(self.project, &package.name, repository)
+        {
+            let tag = self
+                .project
+                .git_tag(&package.name, &stable_info.version.to_string())?;
+            diff.base_version = Some(stable_info.version);
+            (tag, Some(stable_info.commit))
+        } else {
+            // No stable tag found — fall back to constructing tag from package version.
+            let tag = self
+                .project
+                .git_tag(&package.name, &package.version.to_string())?;
+            let commit = repository.get_tag_commit(&tag);
+            (tag, commit)
+        };
 
         info!(
             "{}: diffing from tag {} (commit {})",
@@ -901,7 +898,12 @@ impl Updater<'_> {
                         // At this point of the git history, the two packages are different,
                         // which means that this commit is not present in the published package.
                         let first_line = current_commit_message.lines().next().unwrap_or("");
-                        info!("{}: commit {} {}", package.name, &current_commit_hash[..7.min(current_commit_hash.len())], first_line);
+                        info!(
+                            "{}: commit {} {}",
+                            package.name,
+                            &current_commit_hash[..7.min(current_commit_hash.len())],
+                            first_line
+                        );
                         diff.commits.push(Commit::new(
                             current_commit_hash,
                             current_commit_message.clone(),
@@ -910,7 +912,12 @@ impl Updater<'_> {
                 }
             } else if are_changed_files_in_pkg()? {
                 let first_line = current_commit_message.lines().next().unwrap_or("");
-                info!("{}: commit {} {}", package.name, &current_commit_hash[..7.min(current_commit_hash.len())], first_line);
+                info!(
+                    "{}: commit {} {}",
+                    package.name,
+                    &current_commit_hash[..7.min(current_commit_hash.len())],
+                    first_line
+                );
                 diff.commits.push(Commit::new(
                     current_commit_hash,
                     current_commit_message.clone(),
@@ -1331,15 +1338,28 @@ struct StableTagInfo {
     commit: String,
 }
 
+/// Parse a semver version from a tag in the form `{prefix}{version}{suffix}`.
+fn parse_version_from_tag(tag: &str, prefix: &str, suffix: &str) -> Option<Version> {
+    tag.strip_prefix(prefix)
+        .and_then(|rest| rest.strip_suffix(suffix))
+        .and_then(|v| Version::parse(v).ok())
+}
+
 /// Given all tags and the prefix/suffix pattern from the tag template,
-/// find the highest stable (non-prerelease) version.
-fn best_stable_version_from_tags(tags: &[String], prefix: &str, suffix: &str) -> Option<Version> {
+/// find the highest stable (non-prerelease) version among tags accepted by `tag_filter`.
+fn best_stable_version_from_tags<F>(
+    tags: &[String],
+    prefix: &str,
+    suffix: &str,
+    mut tag_filter: F,
+) -> Option<Version>
+where
+    F: FnMut(&str) -> bool,
+{
     tags.iter()
-        .filter_map(|tag| {
-            tag.strip_prefix(prefix)
-                .and_then(|rest| rest.strip_suffix(suffix))
-        })
-        .filter_map(|v| Version::parse(v).ok())
+        .map(String::as_str)
+        .filter(|tag| tag_filter(tag))
+        .filter_map(|tag| parse_version_from_tag(tag, prefix, suffix))
         .filter(|v| v.pre.is_empty())
         .max()
 }
@@ -1368,18 +1388,43 @@ fn find_last_stable_tag(
 
     let (prefix, suffix) = rendered.split_once(placeholder)?;
 
-    let version = best_stable_version_from_tags(&all_tags, prefix, suffix)?;
+    // Only consider tags reachable from the current checkout commit.
+    // This avoids selecting tags from unrelated branches/release lines.
+    let current_commit = repository.current_commit_hash().ok()?;
+    let version = best_stable_version_from_tags(&all_tags, prefix, suffix, |tag| {
+        let Some(tag_commit) = repository.get_tag_commit(tag) else {
+            return false;
+        };
+        repository.is_ancestor(&tag_commit, &current_commit)
+    })?;
     let tag = project.git_tag(package_name, &version.to_string()).ok()?;
     let commit = repository.get_tag_commit(&tag)?;
     Some(StableTagInfo { version, commit })
 }
 
-/// Given all tags and a rendered RC prefix (e.g. "pkg-v1.1.0-rc."),
-/// find the highest existing RC number. Returns 0 if none found.
-fn max_rc_number_from_tags(tags: &[String], rc_tag_prefix: &str) -> u64 {
+/// Parse an RC number from a tag in the form `{prefix}{rc_number}{suffix}`.
+fn parse_rc_number_from_tag(tag: &str, prefix: &str, suffix: &str) -> Option<u64> {
+    tag.strip_prefix(prefix)
+        .and_then(|rest| rest.strip_suffix(suffix))
+        .and_then(|n| n.parse::<u64>().ok())
+}
+
+/// Given all tags and a rendered RC prefix/suffix pair,
+/// find the highest existing RC number among tags accepted by `tag_filter`.
+/// Returns 0 if none found.
+fn max_rc_number_from_tags<F>(
+    tags: &[String],
+    rc_tag_prefix: &str,
+    rc_tag_suffix: &str,
+    mut tag_filter: F,
+) -> u64
+where
+    F: FnMut(&str) -> bool,
+{
     tags.iter()
-        .filter_map(|tag| tag.strip_prefix(rc_tag_prefix))
-        .filter_map(|n| n.parse::<u64>().ok())
+        .map(String::as_str)
+        .filter(|tag| tag_filter(tag))
+        .filter_map(|tag| parse_rc_number_from_tag(tag, rc_tag_prefix, rc_tag_suffix))
         .max()
         .unwrap_or(0)
 }
@@ -1395,15 +1440,32 @@ fn find_next_rc_number(
     repository: &Repo,
 ) -> u64 {
     let all_tags = repository.get_all_tags();
+    let current_commit = repository.current_commit_hash().ok();
 
-    // Build the expected tag prefix for this target version's RCs.
-    // E.g. for target 1.1.0, we look for tags like "pkg-v1.1.0-rc.N"
-    let rc_prefix_version = format!("{target_stable}-rc.");
-    let rendered = project
-        .git_tag(package_name, &rc_prefix_version)
-        .unwrap_or_default();
+    // Build the expected tag shape for this target version's RCs.
+    // E.g. for target 1.1.0 and template "{{package}}-v{{version}}",
+    // rendered is "pkg-v1.1.0-rc.__RCNUM__".
+    let rc_placeholder = "__RCNUM__";
+    let rc_version_with_placeholder = format!("{target_stable}-rc.{rc_placeholder}");
+    let Ok(rendered) = project.git_tag(package_name, &rc_version_with_placeholder) else {
+        return 1;
+    };
+    let Some((prefix, suffix)) = rendered.split_once(rc_placeholder) else {
+        return 1;
+    };
 
-    max_rc_number_from_tags(&all_tags, &rendered) + 1
+    let max_rc = max_rc_number_from_tags(&all_tags, prefix, suffix, |tag| {
+        // Keep behavior robust if current commit cannot be determined.
+        let Some(current_commit) = current_commit.as_ref() else {
+            return true;
+        };
+        let Some(tag_commit) = repository.get_tag_commit(tag) else {
+            return false;
+        };
+        repository.is_ancestor(&tag_commit, current_commit)
+    });
+
+    max_rc + 1
 }
 
 /// Propagate bump levels through the dependency graph.
@@ -1488,13 +1550,9 @@ mod tests {
 
     #[test]
     fn stable_tag_found_among_rc_tags() {
-        let t = tags(&[
-            "pkg-v1.0.0",
-            "pkg-v1.1.0-rc.1",
-            "pkg-v1.1.0-rc.2",
-        ]);
+        let t = tags(&["pkg-v1.0.0", "pkg-v1.1.0-rc.1", "pkg-v1.1.0-rc.2"]);
         assert_eq!(
-            best_stable_version_from_tags(&t, "pkg-v", ""),
+            best_stable_version_from_tags(&t, "pkg-v", "", |_| true),
             Some(Version::new(1, 0, 0))
         );
     }
@@ -1503,7 +1561,7 @@ mod tests {
     fn highest_stable_selected() {
         let t = tags(&["pkg-v1.0.0", "pkg-v1.1.0", "pkg-v0.9.0"]);
         assert_eq!(
-            best_stable_version_from_tags(&t, "pkg-v", ""),
+            best_stable_version_from_tags(&t, "pkg-v", "", |_| true),
             Some(Version::new(1, 1, 0))
         );
     }
@@ -1511,20 +1569,35 @@ mod tests {
     #[test]
     fn no_stable_tags_returns_none() {
         let t = tags(&["pkg-v1.0.0-rc.1", "pkg-v1.0.0-rc.2"]);
-        assert_eq!(best_stable_version_from_tags(&t, "pkg-v", ""), None);
+        assert_eq!(
+            best_stable_version_from_tags(&t, "pkg-v", "", |_| true),
+            None
+        );
     }
 
     #[test]
     fn empty_tags_returns_none() {
-        assert_eq!(best_stable_version_from_tags(&[], "pkg-v", ""), None);
+        assert_eq!(
+            best_stable_version_from_tags(&[], "pkg-v", "", |_| true),
+            None
+        );
     }
 
     #[test]
     fn non_matching_tags_ignored() {
         let t = tags(&["other-v1.0.0", "pkg-v0.5.0", "unrelated"]);
         assert_eq!(
-            best_stable_version_from_tags(&t, "pkg-v", ""),
+            best_stable_version_from_tags(&t, "pkg-v", "", |_| true),
             Some(Version::new(0, 5, 0))
+        );
+    }
+
+    #[test]
+    fn non_ancestor_stable_tags_are_ignored() {
+        let t = tags(&["pkg-v1.0.0", "pkg-v2.0.0"]);
+        assert_eq!(
+            best_stable_version_from_tags(&t, "pkg-v", "", |tag| tag != "pkg-v2.0.0"),
+            Some(Version::new(1, 0, 0))
         );
     }
 
@@ -1532,34 +1605,60 @@ mod tests {
 
     #[test]
     fn finds_max_rc() {
-        let t = tags(&[
-            "pkg-v1.1.0-rc.1",
-            "pkg-v1.1.0-rc.3",
-            "pkg-v1.1.0-rc.2",
-        ]);
-        assert_eq!(max_rc_number_from_tags(&t, "pkg-v1.1.0-rc."), 3);
+        let t = tags(&["pkg-v1.1.0-rc.1", "pkg-v1.1.0-rc.3", "pkg-v1.1.0-rc.2"]);
+        assert_eq!(
+            max_rc_number_from_tags(&t, "pkg-v1.1.0-rc.", "", |_| true),
+            3
+        );
     }
 
     #[test]
     fn no_rc_tags_returns_zero() {
-        assert_eq!(max_rc_number_from_tags(&[], "pkg-v1.1.0-rc."), 0);
+        assert_eq!(
+            max_rc_number_from_tags(&[], "pkg-v1.1.0-rc.", "", |_| true),
+            0
+        );
     }
 
     #[test]
     fn different_version_rc_ignored() {
         let t = tags(&["pkg-v1.0.0-rc.5", "pkg-v1.0.0-rc.3"]);
         // Looking for 1.1.0 RCs, but only 1.0.0 RCs exist.
-        assert_eq!(max_rc_number_from_tags(&t, "pkg-v1.1.0-rc."), 0);
+        assert_eq!(
+            max_rc_number_from_tags(&t, "pkg-v1.1.0-rc.", "", |_| true),
+            0
+        );
     }
 
     #[test]
     fn non_numeric_suffix_ignored() {
+        let t = tags(&["pkg-v1.1.0-rc.2", "pkg-v1.1.0-rc.beta", "pkg-v1.1.0-rc.3"]);
+        assert_eq!(
+            max_rc_number_from_tags(&t, "pkg-v1.1.0-rc.", "", |_| true),
+            3
+        );
+    }
+
+    #[test]
+    fn suffix_templates_are_supported_for_rc_numbers() {
         let t = tags(&[
-            "pkg-v1.1.0-rc.2",
-            "pkg-v1.1.0-rc.beta",
-            "pkg-v1.1.0-rc.3",
+            "release-pkg-1.1.0-rc.2-prod",
+            "release-pkg-1.1.0-rc.10-prod",
+            "release-pkg-1.1.0-prod",
         ]);
-        assert_eq!(max_rc_number_from_tags(&t, "pkg-v1.1.0-rc."), 3);
+        assert_eq!(
+            max_rc_number_from_tags(&t, "release-pkg-1.1.0-rc.", "-prod", |_| true),
+            10
+        );
+    }
+
+    #[test]
+    fn non_ancestor_rc_tags_are_ignored() {
+        let t = tags(&["pkg-v1.1.0-rc.2", "pkg-v1.1.0-rc.9", "pkg-v1.1.0-rc.3"]);
+        assert_eq!(
+            max_rc_number_from_tags(&t, "pkg-v1.1.0-rc.", "", |tag| tag != "pkg-v1.1.0-rc.9"),
+            3
+        );
     }
 
     // ── propagate_bumps tests ───────────────────────────────────────
