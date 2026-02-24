@@ -107,10 +107,10 @@ impl ReleasePr {
 #[derive(Serialize, Debug)]
 pub struct PrPackageRelease {
     /// The name of the package.
-    package_name: String,
+    pub package_name: String,
     /// The next version of the package.
     /// The PR updates the package to this version.
-    version: Version,
+    pub version: Version,
 }
 
 /// Open a pull request with the next packages versions of a local rust project
