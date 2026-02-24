@@ -33,6 +33,8 @@ pub struct ReleasePrRequest {
     labels: Vec<String>,
     /// PR Branch Prefix
     branch_prefix: String,
+    /// PR Branch Suffix
+    branch_suffix: Option<String>,
     pub update_request: UpdateRequest,
 }
 
@@ -44,6 +46,7 @@ impl ReleasePrRequest {
             draft: false,
             labels: vec![],
             branch_prefix: DEFAULT_BRANCH_PREFIX.to_string(),
+            branch_suffix: None,
             update_request,
         }
     }
@@ -72,6 +75,11 @@ impl ReleasePrRequest {
         if let Some(branch_prefix) = pr_branch_prefix {
             self.branch_prefix = branch_prefix;
         }
+        self
+    }
+
+    pub fn with_branch_suffix(mut self, pr_branch_suffix: Option<String>) -> Self {
+        self.branch_suffix = pr_branch_suffix;
         self
     }
 }
@@ -165,6 +173,7 @@ pub async fn release_pr(input: &ReleasePrRequest) -> anyhow::Result<Option<Relea
                     pr_body: input.pr_body_template.clone(),
                     pr_labels: input.labels.clone(),
                     pr_branch_prefix: input.branch_prefix.clone(),
+                    pr_branch_suffix: input.branch_suffix.clone(),
                 },
             )
             .await?;
@@ -181,6 +190,7 @@ struct ReleasePrOptions {
     pr_body: Option<String>,
     pr_labels: Vec<String>,
     pr_branch_prefix: String,
+    pr_branch_suffix: Option<String>,
 }
 
 async fn open_or_update_release_pr(
@@ -222,6 +232,7 @@ async fn open_or_update_release_pr(
             packages_to_update,
             project_contains_multiple_pub_packages,
             &release_pr_options.pr_branch_prefix,
+            release_pr_options.pr_branch_suffix.as_deref(),
             release_pr_options.pr_name,
             release_pr_options.pr_body.as_deref(),
         )?

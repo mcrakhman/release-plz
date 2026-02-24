@@ -58,11 +58,12 @@ impl Pr {
         packages_to_update: &PackagesUpdate,
         project_contains_multiple_pub_packages: bool,
         branch_prefix: &str,
+        branch_suffix: Option<&str>,
         title_template: Option<String>,
         body_template: Option<&str>,
     ) -> anyhow::Result<Self> {
         let pr = Self {
-            branch: release_branch(branch_prefix),
+            branch: release_branch(branch_prefix, branch_suffix),
             base_branch: default_branch.to_string(),
             title: pr_title(
                 packages_to_update,
@@ -87,13 +88,16 @@ impl Pr {
     }
 }
 
-fn release_branch(prefix: &str) -> String {
+fn release_branch(prefix: &str, suffix: Option<&str>) -> String {
     let now = chrono::offset::Utc::now();
     // Convert to a string of format "2018-01-26T18:30:09Z".
     let now = now.to_rfc3339_opts(SecondsFormat::Secs, true);
     // ':' is not a valid character for a branch name.
     let now = now.replace(':', "-");
-    format!("{prefix}{now}")
+    match suffix {
+        Some(suffix) => format!("{prefix}{now}{suffix}"),
+        None => format!("{prefix}{now}"),
+    }
 }
 
 fn pr_title(
