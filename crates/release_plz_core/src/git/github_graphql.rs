@@ -19,6 +19,31 @@ pub async fn commit_changes(
     branch: &str,
 ) -> Result<String> {
     let commit = GithubCommit::new(&client.remote.owner_slash_repo(), repo, message, branch)?;
+    send_commit(client, commit).await
+}
+
+/// Commit only the listed file paths (relative to repo root) using GitHub's
+/// GraphQL `createCommitOnBranch` mutation.  Unlike [`commit_changes`], this
+/// does **not** scan the working tree — only the explicitly provided paths are
+/// included as additions.
+pub async fn commit_specific_files(
+    client: &GitClient,
+    repo: &Repo,
+    message: &str,
+    branch: &str,
+    paths: &[&str],
+) -> Result<String> {
+    let commit = GithubCommit::from_paths(
+        &client.remote.owner_slash_repo(),
+        repo,
+        message,
+        branch,
+        paths,
+    )?;
+    send_commit(client, commit).await
+}
+
+async fn send_commit(client: &GitClient, commit: GithubCommit) -> Result<String> {
     let graphql_endpoint = get_graphql_endpoint(&client.remote);
 
     let commit_query = commit
@@ -89,6 +114,24 @@ impl GithubCommit {
             current_head: repo.current_commit_hash()?,
             deletions: removed_files(repo)?,
             additions: changed_files(repo)?,
+            repo_dir: repo.directory().to_owned(),
+        })
+    }
+
+    fn from_paths(
+        owner_slash_repo: &str,
+        repo: &Repo,
+        message: &str,
+        branch: &str,
+        paths: &[&str],
+    ) -> Result<Self> {
+        Ok(Self {
+            owner_slash_repo: owner_slash_repo.to_owned(),
+            branch: branch.to_owned(),
+            message: message.to_owned(),
+            current_head: repo.current_commit_hash()?,
+            deletions: vec![],
+            additions: paths.iter().map(|p| p.to_string()).collect(),
             repo_dir: repo.directory().to_owned(),
         })
     }
